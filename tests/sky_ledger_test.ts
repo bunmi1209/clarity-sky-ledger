@@ -72,7 +72,7 @@ Clarinet.test({
 });
 
 Clarinet.test({
-    name: "Can transfer credits between accounts",
+    name: "Can create and purchase market listings",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const airline1 = accounts.get('wallet_1')!;
         const airline2 = accounts.get('wallet_2')!;
@@ -85,21 +85,27 @@ Clarinet.test({
             ], airline1.address)
         ]);
 
-        // Transfer credits
-        let transferBlock = chain.mineBlock([
-            Tx.contractCall('sky_ledger', 'transfer-credits', [
+        // Create market listing
+        let listingBlock = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'create-listing', [
                 types.uint(50),
-                types.principal(airline2.address)
+                types.uint(10)
             ], airline1.address)
         ]);
 
-        transferBlock.receipts[0].result.expectOk();
+        listingBlock.receipts[0].result.expectOk();
+
+        // Purchase listing
+        let purchaseBlock = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'purchase-listing', [
+                types.uint(1)
+            ], airline2.address)
+        ]);
+
+        purchaseBlock.receipts[0].result.expectOk();
 
         // Verify balances
         let balanceBlock = chain.mineBlock([
-            Tx.contractCall('sky_ledger', 'get-credit-balance', [
-                types.principal(airline1.address)
-            ], airline1.address),
             Tx.contractCall('sky_ledger', 'get-credit-balance', [
                 types.principal(airline2.address)
             ], airline2.address)
@@ -109,9 +115,46 @@ Clarinet.test({
             balanceBlock.receipts[0].result,
             types.ok(types.uint(50))
         );
+    }
+});
+
+Clarinet.test({
+    name: "Can retire verified credits",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const airline1 = accounts.get('wallet_1')!;
+
+        // Register and verify credits
+        let block = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'register-credits', [
+                types.ascii("FL123"),
+                types.uint(100)
+            ], airline1.address)
+        ]);
+
+        let verifyBlock = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'verify-credits', [
+                types.uint(1)
+            ], deployer.address)
+        ]);
+
+        // Retire credits
+        let retireBlock = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'retire-credits', [
+                types.uint(1)
+            ], airline1.address)
+        ]);
+
+        retireBlock.receipts[0].result.expectOk();
+
+        // Check total retired
+        let totalRetiredBlock = chain.mineBlock([
+            Tx.contractCall('sky_ledger', 'get-total-retired', [], deployer.address)
+        ]);
+
         assertEquals(
-            balanceBlock.receipts[1].result,
-            types.ok(types.uint(50))
+            totalRetiredBlock.receipts[0].result,
+            types.ok(types.uint(100))
         );
     }
 });
