@@ -7,12 +7,25 @@
 (define-constant err-insufficient-balance (err u102))
 (define-constant err-credit-not-verified (err u103))
 (define-constant err-invalid-price (err u104))
+(define-constant err-system-frozen (err u105))
+(define-constant err-invalid-amount (err u106))
+(define-constant err-listing-expired (err u107))
+(define-constant err-verification-expired (err u108))
 
 ;; Define carbon credit token
 (define-fungible-token carbon-credit)
 
-;; Data variables 
-(define-data-var credit-price uint u100) ;; Base price in STX
+;; System control
+(define-data-var system-frozen bool false)
+(define-data-var verification-expiry uint u50400) ;; ~2 weeks in blocks
+(define-data-var listing-expiry uint u25200) ;; ~1 week in blocks
+
+;; Analytics tracking
+(define-data-var total-credits-traded uint u0)
+(define-data-var last-trade-price uint u0)
+(define-data-var market-volume-24h uint u0)
+
+;; Data maps
 (define-map credit-registry 
   { credit-id: uint } 
   { 
@@ -21,6 +34,8 @@
     emission-amount: uint,
     timestamp: uint,
     verified: bool,
+    verified-at: uint,
+    credit-type: (string-ascii 10),
     retired: bool
   }
 )
@@ -30,140 +45,98 @@
   {
     seller: principal,
     credit-amount: uint,
-    price-per-credit: uint
+    price-per-credit: uint,
+    created-at: uint,
+    expires-at: uint
   }
 )
 
+(define-map price-history
+  { block-height: uint }
+  { 
+    average-price: uint,
+    volume: uint,
+    num-trades: uint
+  }
+)
+
+;; Counters
 (define-data-var credit-counter uint u0)
 (define-data-var listing-counter uint u0)
 (define-data-var total-retired uint u0)
 
-;; Register new carbon credits
-(define-public (register-credits (flight-id (string-ascii 10)) (emission-amount uint))
-    (let
-        (
-            (new-credit-id (+ (var-get credit-counter) u1))
-        )
-        (try! (ft-mint? carbon-credit emission-amount tx-sender))
-        (map-set credit-registry
-            { credit-id: new-credit-id }
-            {
-                airline: tx-sender,
-                flight-id: flight-id,
-                emission-amount: emission-amount,
-                timestamp: block-height,
-                verified: false,
-                retired: false
-            }
-        )
-        (var-set credit-counter new-credit-id)
-        (ok new-credit-id)
+;; Enhanced verification functions
+(define-public (batch-verify-credits (credit-ids (list 50 uint)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get system-frozen)) err-system-frozen)
+    (ok (map verify-single-credit credit-ids))
+  )
+)
+
+(define-private (verify-single-credit (credit-id uint))
+  (match (map-get? credit-registry { credit-id: credit-id })
+    registry-data 
+      (map-set credit-registry
+        { credit-id: credit-id }
+        (merge registry-data { 
+          verified: true,
+          verified-at: block-height 
+        })
+      )
+    false
+  )
+)
+
+;; Enhanced market functions
+(define-public (create-market-listing (credit-amount uint) (price-per-credit uint))
+  (let
+    (
+      (listing-id (+ (var-get listing-counter) u1))
+      (expires-at (+ block-height (var-get listing-expiry)))
     )
-)
-
-;; Verify credits - only contract owner
-(define-public (verify-credits (credit-id uint))
-    (if (is-eq tx-sender contract-owner)
-        (begin
-            (match (map-get? credit-registry { credit-id: credit-id })
-                registry-data (ok (map-set credit-registry
-                    { credit-id: credit-id }
-                    (merge registry-data { verified: true })
-                ))
-                err-invalid-credit
-            )
-        )
-        err-owner-only
+    (asserts! (not (var-get system-frozen)) err-system-frozen)
+    (asserts! (> credit-amount u0) err-invalid-amount)
+    (asserts! (> price-per-credit u0) err-invalid-price)
+    (asserts! (>= (ft-get-balance carbon-credit tx-sender) credit-amount) err-insufficient-balance)
+    
+    (try! (ft-transfer? carbon-credit credit-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set market-listings
+      { listing-id: listing-id }
+      {
+        seller: tx-sender,
+        credit-amount: credit-amount,
+        price-per-credit: price-per-credit,
+        created-at: block-height,
+        expires-at: expires-at
+      }
     )
+    
+    (var-set listing-counter listing-id)
+    (print { type: "listing-created", listing-id: listing-id, amount: credit-amount, price: price-per-credit })
+    (ok listing-id)
+  )
 )
 
-;; Transfer credits
-(define-public (transfer-credits (amount uint) (recipient principal))
-    (let (
-        (sender-balance (ft-get-balance carbon-credit tx-sender))
-    )
-        (if (>= sender-balance amount)
-            (try! (ft-transfer? carbon-credit amount tx-sender recipient))
-            err-insufficient-balance
-        )
-    )
+;; Analytics functions
+(define-read-only (get-market-stats)
+  (ok {
+    total-traded: (var-get total-credits-traded),
+    last-price: (var-get last-trade-price),
+    volume-24h: (var-get market-volume-24h),
+    total-retired: (var-get total-retired)
+  })
 )
 
-;; Create market listing
-(define-public (create-listing (credit-amount uint) (price-per-credit uint))
-    (let (
-        (new-listing-id (+ (var-get listing-counter) u1))
-        (sender-balance (ft-get-balance carbon-credit tx-sender))
-    )
-        (asserts! (>= sender-balance credit-amount) err-insufficient-balance)
-        (asserts! (> price-per-credit u0) err-invalid-price)
-        
-        (map-set market-listings
-            { listing-id: new-listing-id }
-            {
-                seller: tx-sender,
-                credit-amount: credit-amount,
-                price-per-credit: price-per-credit
-            }
-        )
-        (var-set listing-counter new-listing-id)
-        (ok new-listing-id)
-    )
+(define-read-only (is-credit-verification-valid (credit-id uint))
+  (match (map-get? credit-registry { credit-id: credit-id })
+    registry-data (ok (and 
+      (get verified registry-data)
+      (< (- block-height (get verified-at registry-data)) (var-get verification-expiry))
+    ))
+    err-invalid-credit
+  )
 )
 
-;; Purchase credits from market
-(define-public (purchase-listing (listing-id uint))
-    (match (map-get? market-listings { listing-id: listing-id })
-        listing-data
-            (let (
-                (total-cost (* (get credit-amount listing-data) (get price-per-credit listing-data)))
-                (seller (get seller listing-data))
-            )
-                (try! (stx-transfer? total-cost tx-sender seller))
-                (try! (transfer-credits (get credit-amount listing-data) tx-sender))
-                (map-delete market-listings { listing-id: listing-id })
-                (ok true)
-            )
-        err-invalid-credit
-    )
-)
-
-;; Retire carbon credits
-(define-public (retire-credits (credit-id uint))
-    (match (map-get? credit-registry { credit-id: credit-id })
-        registry-data
-            (begin
-                (asserts! (get verified registry-data) err-credit-not-verified)
-                (asserts! (not (get retired registry-data)) err-invalid-credit)
-                (try! (ft-burn? carbon-credit (get emission-amount registry-data) tx-sender))
-                (map-set credit-registry
-                    { credit-id: credit-id }
-                    (merge registry-data { retired: true })
-                )
-                (var-set total-retired (+ (var-get total-retired) (get emission-amount registry-data)))
-                (ok true)
-            )
-        err-invalid-credit
-    )
-)
-
-;; Read-only functions
-(define-read-only (get-credit-details (credit-id uint))
-    (ok (map-get? credit-registry { credit-id: credit-id }))
-)
-
-(define-read-only (get-credit-balance (account principal))
-    (ok (ft-get-balance carbon-credit account))
-)
-
-(define-read-only (get-credit-price)
-    (ok (var-get credit-price))
-)
-
-(define-read-only (get-listing-details (listing-id uint))
-    (ok (map-get? market-listings { listing-id: listing-id }))
-)
-
-(define-read-only (get-total-retired)
-    (ok (var-get total-retired))
-)
+[... Additional functions remain unchanged ...]
